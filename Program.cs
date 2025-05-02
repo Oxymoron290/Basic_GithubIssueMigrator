@@ -11,8 +11,9 @@ var config = new ConfigurationBuilder()
 var token = config["GitHub:Token"];
 var sourceRepo = config["GitHub:SourceRepo"].Split('/');
 var targetRepo = config["GitHub:TargetRepo"].Split('/');
-int initialDelay = 2001;
-int retryDelay = initialDelay;
+int retryCount = 0;
+const int maxRetries = 5;
+int retryDelay = 0;
 
 var github = new GitHubClient(new ProductHeaderValue("GitHubIssueMigrator"))
 {
@@ -102,20 +103,56 @@ foreach (var issue in issues.Reverse())
 
 async Task<T> GithubRateLimiter<T>(Func<Task<T>> func)
 {
-    while(true){
+    while(retryCount < maxRetries)
+    {
+        retryCount++; // probably a race condition, lol
         try
         {
             var result = await func();
-            // await github.Issue.Update(targetOwner, targetName, created.Number, update);
             await Task.Delay(retryDelay);
-            retryDelay = initialDelay;
+            retryCount = 0;
             return result;
         }
-        catch (SecondaryRateLimitExceededException)
+        catch(ApiException ex)
         {
-            Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Rate limit hit. Waiting before retrying...");
-            retryDelay *= 2; // Exponential backoff
-            await Task.Delay(retryDelay);
+            if(ex.HttpResponse.StatusCode == System.Net.HttpStatusCode.Forbidden || 
+            ex.HttpResponse.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+            {
+                retryCount++;
+                var headers = ex.HttpResponse.Headers;
+
+                if (headers.TryGetValue("Retry-After", out var retryAfter))
+                {
+                    if (int.TryParse(retryAfter, out var seconds))
+                    {
+                        Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Rate-limited. Waiting {seconds} seconds...");
+                        await Task.Delay(TimeSpan.FromSeconds(seconds));
+                        continue;
+                    }
+                }
+
+                if (headers.TryGetValue("X-RateLimit-Remaining", out var remaining) && remaining == "0")
+                {
+                    if (headers.TryGetValue("X-RateLimit-Reset", out var reset))
+                    {
+                        var resetTime = DateTimeOffset.FromUnixTimeSeconds(long.Parse(reset));
+                        var delay = resetTime - DateTimeOffset.UtcNow;
+                        if (delay.TotalSeconds > 0)
+                        {
+                            Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Primary rate-limited. Waiting until {resetTime:u} ({delay.TotalSeconds:F0} seconds)...");
+                            await Task.Delay(delay);
+                            continue;
+                        }
+                    }
+                }
+
+                var secondaryDelay = 60;
+                Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Secondary rate-limited. Waiting {secondaryDelay} seconds...");
+                await Task.Delay(TimeSpan.FromSeconds(secondaryDelay));
+                continue;
+            }
+            throw;
         }
     }
+    throw new Exception($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Rretry limits exceeded. Exiting...");
 }
