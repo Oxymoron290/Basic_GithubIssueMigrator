@@ -8,12 +8,10 @@ var config = new ConfigurationBuilder()
     .AddJsonFile("appsettings.dev.json", optional: false)
     .Build();
 
+var totalPoints = 0;
 var token = config["GitHub:Token"];
 var sourceRepo = config["GitHub:SourceRepo"].Split('/');
 var targetRepo = config["GitHub:TargetRepo"].Split('/');
-int retryCount = 0;
-const int maxRetries = 5;
-int retryDelay = 0;
 
 var github = new GitHubClient(new ProductHeaderValue("GitHubIssueMigrator"))
 {
@@ -25,7 +23,7 @@ var sourceName = sourceRepo[1];
 var targetOwner = targetRepo[0];
 var targetName = targetRepo[1];
 
-Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}]  Migrating issues");
+Log($"Migrating issues");
 
 var issueRequest = new RepositoryIssueRequest
 {
@@ -34,7 +32,9 @@ var issueRequest = new RepositoryIssueRequest
 };
 
 var issues = await github.Issue.GetAllForRepository(sourceOwner, sourceName, issueRequest);
+totalPoints += 1;
 var existingIssues = await github.Issue.GetAllForRepository(targetOwner, targetName, issueRequest);
+totalPoints += 1;
 
 var i = 1;
 foreach (var issue in issues.Reverse())
@@ -42,8 +42,8 @@ foreach (var issue in issues.Reverse())
     // if (issue.PullRequest != null) continue; // skip PRs
     var type = (issue.PullRequest != null) ? "PR" : "Issue";
 
-    Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {i++}) Migrating {type} #{issue.Number}...\n\tTitle: {issue.Title}");
-    // Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}]  {JsonSerializer.Serialize(issue, new JsonSerializerOptions { WriteIndented = true })}");
+    Log($"{i++}) Migrating {type} #{issue.Number}...\n\tTitle: {issue.Title}");
+    // Log($"{JsonSerializer.Serialize(issue, new JsonSerializerOptions { WriteIndented = true })}");
     
     var migrationMarker = $"{type} Migrated from [{sourceOwner}/{sourceName}#{issue.Number}]({issue.HtmlUrl})";
     bool alreadyMigrated = existingIssues.Any(i => i.Body?.Contains(migrationMarker) == true);
@@ -53,7 +53,7 @@ foreach (var issue in issues.Reverse())
         var existingIssue = existingIssues.First(i => i.Body?.Contains(migrationMarker) == true);
         if (existingIssue.State == issue.State)
         {
-            Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}]  Skipping {type} #{issue.Number} (already migrated to #{existingIssue.Number} and status is the same)");
+            Log($"Skipping {type} #{issue.Number} (already migrated to #{existingIssue.Number} and status is the same)");
             continue;
         }
         else
@@ -64,9 +64,10 @@ foreach (var issue in issues.Reverse())
                 State = issue.State.Value
             };
             await GithubRateLimiter(async () => await github.Issue.Update(targetOwner, targetName, existingIssue.Number, update));
-            Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Updated status of {type} #{existingIssue.Number} to {issue.State}");
+            totalPoints += 5;
+            Log($"Updated status of {type} #{existingIssue.Number} to {issue.State}");
         }
-        Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Skipping {type} #{issue.Number} (already migrated to #{existingIssue.Number})");
+        Log($"Skipping {type} #{issue.Number} (already migrated to #{existingIssue.Number})");
         continue;
     }
 
@@ -79,13 +80,16 @@ foreach (var issue in issues.Reverse())
         newIssue.Labels.Add(label.Name);
 
     var created = await GithubRateLimiter(async () => await github.Issue.Create(targetOwner, targetName, newIssue));
+    totalPoints += 5;
 
     // Migrate comments
     var comments = await github.Issue.Comment.GetAllForIssue(sourceOwner, sourceName, issue.Number);
+    totalPoints += 1;
     foreach (var comment in comments)
     {
         var commentBody = $"**Original comment by {comment.User.Login} on {comment.CreatedAt:yyyy-MM-dd}:**\n\n{comment.Body}";
         await GithubRateLimiter(async () => await github.Issue.Comment.Create(targetOwner, targetName, created.Number, comment.Body));
+        totalPoints += 5;
     }
 
     // If original issue was closed, update the state
@@ -96,21 +100,30 @@ foreach (var issue in issues.Reverse())
             State = ItemState.Closed
         };
         await GithubRateLimiter(async () => await github.Issue.Update(targetOwner, targetName, created.Number, update));
+        totalPoints += 5;
     }
 
-    Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Migrated issue #{issue.Number} -> #{created.Number}");
+    Log($"Migrated issue #{issue.Number} -> #{created.Number}");
+}
+
+void Log(string message)
+{
+    Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ({totalPoints}) {message}");
 }
 
 async Task<T> GithubRateLimiter<T>(Func<Task<T>> func)
 {
-    while(retryCount < maxRetries)
+    int retryCount = 0;
+    int secondaryRetries = 0;
+    while(retryCount <= 5)
     {
-        retryCount++; // probably a race condition, lol
+        retryCount++;
         try
         {
             var result = await func();
-            await Task.Delay(retryDelay);
+            secondaryRetries = 0;
             retryCount = 0;
+            Task.Delay(20000).Wait(); // wait 20 seconds between requests to avoid hitting the rate limit
             return result;
         }
         catch(ApiException ex)
@@ -118,6 +131,11 @@ async Task<T> GithubRateLimiter<T>(Func<Task<T>> func)
             if(ex.HttpResponse.StatusCode == System.Net.HttpStatusCode.Forbidden || 
             ex.HttpResponse.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
             {
+                // Log($"Rate-limited. Waiting {ex.HttpResponse.StatusCode} ({ex.Message})...");
+                foreach(var header in ex.HttpResponse.Headers)
+                {
+                    Log($"\t {header.Key}: {header.Value}");
+                }
                 retryCount++;
                 var headers = ex.HttpResponse.Headers;
 
@@ -125,7 +143,7 @@ async Task<T> GithubRateLimiter<T>(Func<Task<T>> func)
                 {
                     if (int.TryParse(retryAfter, out var seconds))
                     {
-                        Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Rate-limited. Waiting {seconds} seconds...");
+                        Log($"Rate-limited. Waiting {seconds} seconds...");
                         await Task.Delay(TimeSpan.FromSeconds(seconds));
                         continue;
                     }
@@ -139,15 +157,15 @@ async Task<T> GithubRateLimiter<T>(Func<Task<T>> func)
                         var delay = resetTime - DateTimeOffset.UtcNow;
                         if (delay.TotalSeconds > 0)
                         {
-                            Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Primary rate-limited. Waiting until {resetTime:u} ({delay.TotalSeconds:F0} seconds)...");
+                            Log($"Primary rate-limited. Waiting until {resetTime:u} ({delay.TotalSeconds:F0} seconds)...");
                             await Task.Delay(delay);
                             continue;
                         }
                     }
                 }
 
-                var secondaryDelay = 60;
-                Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Secondary rate-limited. Waiting {secondaryDelay} seconds...");
+                var secondaryDelay = 60 * (int)Math.Pow(2, secondaryRetries++);
+                Log($"Secondary rate-limited. Waiting {secondaryDelay} seconds...");
                 await Task.Delay(TimeSpan.FromSeconds(secondaryDelay));
                 continue;
             }
