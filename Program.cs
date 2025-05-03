@@ -123,7 +123,7 @@ async Task<T> GithubRateLimiter<T>(Func<Task<T>> func)
             var result = await func();
             secondaryRetries = 0;
             retryCount = 0;
-            Task.Delay(20000).Wait(); // wait 20 seconds between requests to avoid hitting the rate limit
+            Task.Delay(2000).Wait(); // wait 2 seconds between requests to avoid hitting the rate limit
             return result;
         }
         catch(ApiException ex)
